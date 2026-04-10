@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# claude-contained — Run Claude Code in a sandboxed Docker container
+# Usage:
+#   claude-contained                     # interactive session in current dir
+#   claude-contained "fix the tests"     # one-shot task
+#   claude-contained --build             # (re)build the container image
+#   claude-contained --shell             # drop into a bash shell in the container
+#   claude-contained --update            # update pinned image digest & CC version
+#
+# Environment variables:
+#   CLAUDE_CODE_OAUTH_TOKEN  — OAuth token from Max/Pro subscription (preferred)
+#                              Get it via: claude login && claude setup-token
+#   ANTHROPIC_API_KEY        — API key for pay-per-token billing (fallback)
+#   CLAUDE_CONTAINED_IMAGE   — Docker image name       (default: claude-contained)
+#   CLAUDE_CONTAINED_MODEL   — Model override           (default: unset, uses CC default)
+#   CLAUDE_CONTAINED_NETWORK — "none" | "default"       (default: default)
+#                              "none"    = total network isolation
+#                              "default" = normal Docker networking
+
+set -euo pipefail
+
+# Load auth token from dedicated config file if not already in environment.
+# Create this file with:  echo 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...' > ~/.config/claude-contained.env
+ENV_FILE="${HOME}/.config/claude-contained.env"
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$ENV_FILE" ]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
+# ─── Defaults ────────────────────────────────────────────────────────────────
+IMAGE="${CLAUDE_CONTAINED_IMAGE:-claude-contained}"
+NETWORK_MODE="${CLAUDE_CONTAINED_NETWORK:-default}"
+MODEL="${CLAUDE_CONTAINED_MODEL:-}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+info()  { echo -e "${GREEN}▶${RESET} $*"; }
+dim()   { echo -e "${DIM}$*${RESET}"; }
+die()   { echo -e "${RED}✖ $*${RESET}" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+claude-contained — sandboxed Claude Code via Docker
+
+Usage:
+  claude-contained                     Interactive session (current dir mounted)
+  claude-contained "do something"      One-shot task with prompt
+  claude-contained --build             Build / rebuild the Docker image
+  claude-contained --shell             Open a bash shell in the container
+  claude-contained --update            Update pinned image digest & CC version
+  claude-contained --help              Show this help
+
+Environment:
+  CLAUDE_CODE_OAUTH_TOKEN    OAuth token for Max/Pro subscription (preferred)
+                             Get it: claude login && claude setup-token
+  ANTHROPIC_API_KEY          API key for pay-per-token billing (fallback)
+  CLAUDE_CONTAINED_IMAGE     Image name            (default: claude-contained)
+  CLAUDE_CONTAINED_MODEL     Model to use           (default: CC default)
+  CLAUDE_CONTAINED_NETWORK   "default" | "none"     (default: default)
+EOF
+  exit 0
+}
+
+# Temp files/dirs (global so EXIT trap can clean them up)
+_BUILD_TMPDIR=""
+_AUTH_ENV_FILE=""
+cleanup() {
+  [ -n "$_BUILD_TMPDIR" ] && rm -rf "$_BUILD_TMPDIR"
+  [ -n "$_AUTH_ENV_FILE" ] && rm -f "$_AUTH_ENV_FILE"
+}
+trap cleanup EXIT
+
+# ─── Build ───────────────────────────────────────────────────────────────────
+build_image() {
+  info "Building image '${IMAGE}'..."
+
+  _BUILD_TMPDIR="$(mktemp -d)"
+
+  cat > "${_BUILD_TMPDIR}/Dockerfile" <<'DOCKERFILE'
+FROM node:20-bookworm@sha256:8789e1e0752d81088a085689c04fdb7a5b16e8102e353118a4b049bbf05db8ac
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl jq fzf ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code globally (pinned version)
+RUN npm install -g @anthropic-ai/claude-code@2.1.100
+
+# Non-root user (--dangerously-skip-permissions requires non-root)
+RUN useradd -m -s /bin/bash claude
+
+# Skip the interactive onboarding/login wizard.
+# The actual auth token comes via CLAUDE_CODE_OAUTH_TOKEN env var at runtime.
+RUN mkdir -p /home/claude/.claude && \
+    echo '{"hasCompletedOnboarding":true}' > /home/claude/.claude.json && \
+    echo '{}' > /home/claude/.claude/.credentials.json && \
+    chown -R claude:claude /home/claude/.claude /home/claude/.claude.json
+
+USER claude
+
+WORKDIR /workspace
+DOCKERFILE
+
+  docker build -t "${IMAGE}" "${_BUILD_TMPDIR}"
+  info "Image '${IMAGE}' built successfully."
+}
+
+# ─── Update pinned versions ──────────────────────────────────────────────────
+update_pins() {
+  local self
+  self="$(realpath "${BASH_SOURCE[0]}")"
+
+  info "Fetching latest node:20-bookworm digest..."
+  docker pull -q node:20-bookworm >/dev/null
+  local new_digest
+  new_digest="$(docker inspect --format='{{index .RepoDigests 0}}' node:20-bookworm)"
+  new_digest="${new_digest#*@}"   # strip "node@" prefix, keep "sha256:..."
+
+  info "Fetching latest @anthropic-ai/claude-code version..."
+  local new_cc_version
+  new_cc_version="$(npm view @anthropic-ai/claude-code version)"
+
+  # Read current values from the script
+  local old_digest old_cc_version
+  old_digest="$(grep -oP 'node:20-bookworm@\Ksha256:[a-f0-9]+' "$self" | head -1)"
+  old_cc_version="$(grep -oP 'claude-code@\K[0-9]+\.[0-9]+\.[0-9]+' "$self" | head -1)"
+
+  if [ "$old_digest" = "$new_digest" ] && [ "$old_cc_version" = "$new_cc_version" ]; then
+    info "Already up to date."
+    dim "  Image digest:    ${old_digest}"
+    dim "  Claude Code:     ${old_cc_version}"
+    return
+  fi
+
+  # Patch the script in-place
+  if [ "$old_digest" != "$new_digest" ]; then
+    sed -i "s|${old_digest}|${new_digest}|g" "$self"
+    info "Updated image digest:"
+    dim "  old: ${old_digest}"
+    dim "  new: ${new_digest}"
+  else
+    dim "Image digest unchanged: ${old_digest}"
+  fi
+
+  if [ "$old_cc_version" != "$new_cc_version" ]; then
+    sed -i "s|claude-code@${old_cc_version}|claude-code@${new_cc_version}|g" "$self"
+    info "Updated Claude Code version:"
+    dim "  old: ${old_cc_version}"
+    dim "  new: ${new_cc_version}"
+  else
+    dim "Claude Code version unchanged: ${old_cc_version}"
+  fi
+
+  echo ""
+  info "Pins updated. Run '$(basename "$self") --build' to rebuild the image."
+}
+
+# ─── Run ─────────────────────────────────────────────────────────────────────
+run_claude() {
+  # Guard against accidentally mounting overly broad directories
+  local cwd
+  cwd="$(pwd)"
+  case "$cwd" in
+    /|"$HOME")
+      die "Refusing to mount '${cwd}' — run this from a project directory, not \$HOME or /." ;;
+  esac
+
+  local -a docker_args=(
+    --rm
+    -it
+    -v "${cwd}:/workspace"
+    --memory 4g
+    --pids-limit 256
+  )
+
+  # Authentication: write token to a temp env-file so it doesn't leak into
+  # the 'docker run' command line (visible in ps/proc on the host).
+  _AUTH_ENV_FILE="$(mktemp)"
+  chmod 600 "$_AUTH_ENV_FILE"
+
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    echo "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}" > "$_AUTH_ENV_FILE"
+    dim "Auth: Max/Pro subscription (OAuth token)"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" > "$_AUTH_ENV_FILE"
+    dim "Auth: API key (pay-per-token)"
+  else
+    die "Set CLAUDE_CODE_OAUTH_TOKEN (for Max/Pro) or ANTHROPIC_API_KEY (for API billing).
+  Get your OAuth token:  claude login && claude setup-token"
+  fi
+
+  docker_args+=(--env-file "$_AUTH_ENV_FILE")
+
+  # Network mode
+  if [ "${NETWORK_MODE}" = "none" ]; then
+    docker_args+=(--network none)
+    dim "Network: fully isolated (--network none)"
+  else
+    dim "Network: default Docker networking"
+  fi
+
+  # Build claude command line
+  local -a claude_cmd=(claude --dangerously-skip-permissions)
+
+  if [ -n "${MODEL}" ]; then
+    claude_cmd+=(--model "${MODEL}")
+  fi
+
+  if [ $# -gt 0 ]; then
+    claude_cmd+=(-p "$*")
+  fi
+
+  info "Launching Claude Code in container..."
+  dim "  Image:     ${IMAGE}"
+  dim "  Workspace: $(pwd)"
+  dim "  Prompt:    ${*:-(interactive)}"
+  echo ""
+
+  docker run "${docker_args[@]}" "${IMAGE}" "${claude_cmd[@]}"
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+command -v docker &>/dev/null || die "Docker not found. Please install Docker first."
+
+case "${1:-}" in
+  --help|-h)
+    usage
+    ;;
+  --build)
+    build_image
+    ;;
+  --update)
+    update_pins
+    ;;
+  --shell)
+    info "Opening shell in container..."
+    docker run --rm -it -v "$(pwd):/workspace" "${IMAGE}" bash
+    ;;
+  *)
+    if ! docker image inspect "${IMAGE}" &>/dev/null; then
+      info "Image '${IMAGE}' not found. Building it first..."
+      build_image
+    fi
+    run_claude "$@"
+    ;;
+esac
